@@ -16,6 +16,7 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <functional>
 
 #include <cstdio>

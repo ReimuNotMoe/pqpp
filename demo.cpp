@@ -17,11 +17,12 @@
 
 int main() {
 
-	boost::asio::io_service iosvc;
+	boost::asio::io_service iostr;
+//	boost::asio::io_service::strand iostr(iosvc);
 
 	// Coroutine 1
-	boost::asio::spawn(iosvc, [&](boost::asio::yield_context yield_ctx){
-		pqpp::Client client(iosvc, yield_ctx);
+	boost::asio::spawn(iostr, [&](boost::asio::yield_context yield_ctx){
+		pqpp::Client client(iostr, yield_ctx);
 
 		client.config({
 				      .user = "root"
@@ -50,12 +51,12 @@ int main() {
 	});
 
 	// Coroutine 2, callback style
-	boost::asio::spawn(iosvc, [&](boost::asio::yield_context yield_ctx){
-		pqpp::Client client(iosvc, yield_ctx);
+	boost::asio::spawn(iostr, [&](boost::asio::yield_context yield_ctx){
+		pqpp::Client client(iostr, yield_ctx);
 
 		client.config([](auto &cfg){
 			cfg.user = "root";
-			cfg.statement_timeout = 100;
+			cfg.io_timeout = 100;
 		});
 
 		client.connect([&](auto e) {
@@ -82,6 +83,6 @@ int main() {
 
 	});
 
-	iosvc.run();
+	iostr.run();
 
 }

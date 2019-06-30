@@ -15,85 +15,90 @@
 
 using namespace pqpp;
 
-Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx) : io_svc(__io_svc), yield_ctx(__yield_ctx), io_timeout_timer(__io_svc) {
+Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx) : io_strand(__io_svc), yield_ctx(__yield_ctx), io_timeout_timer(__io_svc), idle_timeout_timer(__io_svc) {
 
+}
+
+Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx,
+	       std::shared_ptr<Pool>& __parent_pool) : Client(__io_svc, __yield_ctx) {
+	parent_pool = __parent_pool;
 }
 
 Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx,
 	       struct client_config __config) : Client(__io_svc, __yield_ctx) {
-	conf = std::move(__config);
+	config(std::move(__config));
 }
 
 Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx,
 	       const std::function<void(pqpp::client_config &)> &cfg_func) : Client(__io_svc, __yield_ctx) {
-	cfg_func(conf);
+	config(cfg_func);
 }
 
 Client::~Client() {
-	if (conn)
-		PQfinish(conn);
+	do_destruct();
 }
 
 void Client::config_resolve_envvars() {
 	auto &c = conf;
 
-	if (!c.connection_string.empty())
+	if (!c->connection_string.empty())
 		return;
 
-	if (c.user.empty()) {
+	if (c->user.empty()) {
 		char *p = getenv("PGUSER");
 		if (p)
-			c.user = p;
+			c->user = p;
 		else {
 			throw pqpp::Exception("user not defined");
 		}
 	}
 
-	if (c.password.empty()) {
+	if (c->password.empty()) {
 		char *p = getenv("PGPASSWORD");
 		if (p)
-			c.password = p;
+			c->password = p;
 //		else
 //			throw pqpp::Exception("password not defined");
 	}
 
-	if (c.database.empty()) {
+	if (c->database.empty()) {
 		char *p = getenv("PGDATABASE");
 		if (p)
-			c.database = p;
+			c->database = p;
 //		else
 //			throw pqpp::Exception("database not defined");
 	}
 
-	if (!c.port) {
+	if (!c->port) {
 		char *p = getenv("PGPORT");
 		if (p)
-			c.port = strtol(p, nullptr, 10);
+			c->port = strtol(p, nullptr, 10);
 //		else
 //			throw pqpp::Exception("port not defined");
 	}
 }
 
 void Client::do_connect() {
+	do_destruct();
 	config_resolve_envvars();
 
-	if (conf.connection_string.empty()) {
+	if (conf->connection_string.empty()) {
 		std::string portstr;
-		if (conf.port)
-			portstr = std::to_string(conf.port);
+		if (conf->port)
+			portstr = std::to_string(conf->port);
 
 		const char *keys[6] = {"host", "user", "password", "database", "port", nullptr};
 		const char *vals[6];
-		vals[0] = conf.host.c_str();
-		vals[1] = conf.user.c_str();
-		vals[2] = conf.password.c_str();
-		vals[3] = conf.database.c_str();
+		vals[0] = conf->host.c_str();
+		vals[1] = conf->user.c_str();
+		vals[2] = conf->password.c_str();
+		vals[3] = conf->database.c_str();
 		vals[4] = portstr.c_str();
 		vals[5] = nullptr;
 
 		conn = PQconnectStartParams(keys, vals, 0);
 	} else {
-		conn = PQconnectStart(conf.connection_string.c_str());
+		conn = PQconnectStart(conf->connection_string.c_str());
 	}
 
 	if (!conn) {
@@ -108,19 +113,25 @@ void Client::do_connect() {
 
 	PQsetnonblocking(conn, 1);
 
-	auto fd = PQsocket(conn);
+	int fd = PQsocket(conn);
 	struct sockaddr sa;
-	socklen_t len;
+	socklen_t len = sizeof(sa);
 	if (getsockname(fd, &sa, &len))
-		throw std::system_error(std::error_code(errno, std::system_category()), strerror(errno));
+		throw std::system_error(std::error_code(errno, std::system_category()), "getsockname");
+
+	// We have to dup the FD to avoid double close and races
+	// Neither libpq nor boost allow us to destruct without closing FD
+	int fd_dup = dup(fd);
+	if (fd_dup == -1)
+		throw std::system_error(std::error_code(errno, std::system_category()), "dup");
 
 	if (sa.sa_family == AF_UNIX)
 		unix_socket = std::make_unique<boost::asio::local::stream_protocol::socket>(
-			io_svc, boost::asio::local::stream_protocol(), fd);
+			io_strand, boost::asio::local::stream_protocol(), fd_dup);
 	else
 		tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(
-			io_svc, sa.sa_family == AF_INET ?
-				boost::asio::ip::tcp::v4() : boost::asio::ip::tcp::v6(), fd);
+			io_strand, sa.sa_family == AF_INET ?
+				boost::asio::ip::tcp::v4() : boost::asio::ip::tcp::v6(), fd_dup);
 
 	start_io_timer();
 
@@ -138,7 +149,24 @@ void Client::do_connect() {
 			throw pqpp::Exception(conn, "connection failed");
 		}
 	}
+
+	__connected = true;
 }
+
+void Client::do_destruct() {
+//	unix_socket = std::unique_ptr<boost::asio::local::stream_protocol::socket>();
+//	tcp_socket = std::unique_ptr<boost::asio::ip::tcp::socket>();
+
+	if (conf->io_timeout) {
+		io_timeout_timer.cancel();
+	}
+
+	if (conn) {
+		PQfinish(conn);
+		conn = nullptr;
+	}
+}
+
 
 size_t Client::io_wait_readable() {
 	printf("waiting read\n");
@@ -188,12 +216,22 @@ void Client::do_query() {
 	}
 }
 
+void Client::config(std::shared_ptr<client_config>& __config) {
+	conf = __config;
+}
+
 void Client::config(const std::function<void(pqpp::client_config &)> &cfg_func) {
-	cfg_func(conf);
+	if (!conf)
+		conf = std::make_shared<client_config>();
+
+	cfg_func(*conf);
 }
 
 void Client::config(struct client_config __config) {
-	conf = std::move(__config);
+	if (!conf)
+		conf = std::make_shared<client_config>(__config);
+
+//	conf = std::move(__config);
 }
 
 void Client::connect(std::function<void(const std::exception *err)> __callback) {
@@ -294,6 +332,59 @@ void Client::query(const std::string &__query_str, const std::vector<std::string
 		__callback(&e, {});
 	}
 }
+
+void Client::start_io_timer() {
+	if (conf->io_timeout) {
+		io_timeout_duration = std::chrono::seconds(conf->io_timeout);
+		if (tcp_socket) {
+			boost::asio::spawn(io_strand, [this](boost::asio::yield_context _yield_ctx) {
+				do {
+					boost::system::error_code ec;
+					io_timeout_timer.async_wait(_yield_ctx[ec]);
+
+					if (ec == boost::asio::error::operation_aborted) {
+						return;
+					}
+
+					// Don't touch memory until here
+
+					if (io_timeout_timer.expires_from_now() <=
+					    std::chrono::steady_clock::duration(0)) {
+						boost::system::error_code ec_i;
+						tcp_socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec_i);
+						__connected = false;
+						return;
+					}
+				} while (tcp_socket->is_open());
+			});
+		} else {
+			boost::asio::spawn(io_strand, [this](boost::asio::yield_context _yield_ctx) {
+				do {
+					boost::system::error_code ec;
+					io_timeout_timer.async_wait(_yield_ctx[ec]);
+
+					if (ec == boost::asio::error::operation_aborted) {
+						return;
+					}
+
+					// Don't touch memory until here
+
+
+					if (io_timeout_timer.expires_from_now() <=
+					    std::chrono::steady_clock::duration(0)) {
+						boost::system::error_code ec_i;
+						unix_socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec_i);
+						__connected = false;
+						return;
+					}
+				} while (unix_socket->is_open());
+			});
+		}
+	}
+}
+
+
+
 
 
 
