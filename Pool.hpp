@@ -18,13 +18,40 @@
 #include "Client.hpp"
 
 namespace pqpp {
-	class Pool : public std::enable_shared_from_this<Pool> {
+	class PoolClient;
+
+	class pool_ctx {
+	public:
+		std::shared_ptr<client_config>& conf;
+
+		std::deque<std::shared_ptr<Client>>& queue;
+		size_t& queued_size;
+
+		std::chrono::seconds& queue_timeout;
+		boost::asio::system_timer& queue_timer;
+
+		pool_ctx(std::shared_ptr<client_config>& __conf, std::deque<std::shared_ptr<Client>>& __queue, size_t& __queued_size,
+			std::chrono::seconds& __queue_timeout, boost::asio::system_timer& __queue_timer);
+
+		void give_back(std::shared_ptr<Client> __client);
+	};
+
+	class Pool {
 	protected:
 		std::shared_ptr<client_config> conf;
-		std::vector<std::shared_ptr<Client>> pool;
-		boost::asio::io_service& io_svc;
+
+		boost::asio::io_service& io_service;
+
+		std::shared_ptr<pool_ctx> ctx;
+
 		std::deque<std::shared_ptr<Client>> queue;
 		size_t queued_size = 0;
+
+		std::chrono::seconds queue_timeout;
+		boost::asio::system_timer queue_timer;
+
+		void setup_queue_timer();
+		void give_back(std::shared_ptr<Client> __client);
 
 	public:
 		explicit Pool(boost::asio::io_service& __io_svc);
@@ -35,22 +62,62 @@ namespace pqpp {
 		void config(struct client_config __config);
 		void config(const std::function<void(pqpp::client_config&)>& cfg_func);
 
-		std::shared_ptr<Client> get() {
-			boost::asio::system_timer timer(io_svc);
+		PoolClient client(boost::asio::yield_context& __yield_ctx);
 
-			if (queued_size >= conf->pool_size) {
-				// TODO: wait
-			} else {
+	};
 
-				if (queue.empty()) {
-//					auto ret = std::make_shared<Client>(io_svc, )
-				} else {
-					auto ret = queue.front();
-					queue.pop_front();
-					return ret;
-				}
-			}
+	class PoolExposed : public Pool {
+	public:
+		using Pool::ctx;
+
+		using Pool::conf;
+
+		using Pool::queue;
+		using Pool::queued_size;
+
+		using Pool::io_service;
+
+		using Pool::queue_timer;
+		using Pool::queue_timeout;
+
+		using Pool::setup_queue_timer;
+		using Pool::give_back;
+
+		explicit PoolExposed(boost::asio::io_service& __io_svc) : Pool(__io_svc) {
+
 		}
+	};
+
+	class ClientContainer {
+	public:
+		std::shared_ptr<Client> client;
+
+		~ClientContainer() {
+			if (client)
+				client->release();
+		}
+	};
+
+	class PoolClient {
+	protected:
+		PoolExposed& parent_pool;
+
+		boost::asio::io_service& io_service;
+		boost::asio::yield_context& yield_ctx;
+
+		boost::asio::system_timer& queue_timer;
+		std::chrono::seconds& queue_timeout;
+
+	public:
+		PoolClient(Pool& __parent_pool, boost::asio::yield_context& __yield_ctx);
+
+		ClientContainer get();
+		void get(const std::function<void(const std::exception *, Client *)>& __callback);
+
+		Result query(const std::string& __query_str);
+		Result query(const std::string& __query_str, const std::vector<std::string>& __values);
+		void query(const std::string& __query_str, const std::function<void(const std::exception *err, const Result &res)>& __callback);
+		void query(const std::string& __query_str, const std::vector<std::string>& __values, const std::function<void(const std::exception *err, const Result &res)>& __callback);
 
 	};
 }

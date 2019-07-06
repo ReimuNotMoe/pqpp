@@ -15,6 +15,7 @@
 #define PQPP_PQPP_HPP
 
 #include "Client.hpp"
+#include "Pool.hpp"
 #include "Result.hpp"
 
 #endif //PQPP_PQPP_HPP

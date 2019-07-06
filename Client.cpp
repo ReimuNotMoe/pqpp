@@ -12,24 +12,26 @@
 */
 
 #include "Client.hpp"
+#include "Pool.hpp"
 
 using namespace pqpp;
 
-Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx) : io_strand(__io_svc), yield_ctx(__yield_ctx), io_timeout_timer(__io_svc), idle_timeout_timer(__io_svc) {
+Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context *__yield_ctx) : io_service(__io_svc), yield_ctx(__yield_ctx), io_timeout_timer(__io_svc), idle_timeout_timer(__io_svc) {
 
 }
 
-Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx,
-	       std::shared_ptr<Pool>& __parent_pool) : Client(__io_svc, __yield_ctx) {
-	parent_pool = __parent_pool;
+Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context *__yield_ctx,
+	       std::shared_ptr<pool_ctx> __parent_pool_ctx) : Client(__io_svc, __yield_ctx) {
+	parent_pool_ctx = std::static_pointer_cast<pool_ctx>(__parent_pool_ctx);
+	config(parent_pool_ctx->conf);
 }
 
-Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx,
+Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context *__yield_ctx,
 	       struct client_config __config) : Client(__io_svc, __yield_ctx) {
 	config(std::move(__config));
 }
 
-Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context &__yield_ctx,
+Client::Client(boost::asio::io_service &__io_svc, boost::asio::yield_context *__yield_ctx,
 	       const std::function<void(pqpp::client_config &)> &cfg_func) : Client(__io_svc, __yield_ctx) {
 	config(cfg_func);
 }
@@ -78,6 +80,29 @@ void Client::config_resolve_envvars() {
 	}
 }
 
+void Client::setup_asio_sockets(int __fd) {
+	struct sockaddr sa;
+	socklen_t len = sizeof(sa);
+	if (getsockname(__fd, &sa, &len))
+		throw std::system_error(std::error_code(errno, std::system_category()), "getsockname");
+
+	// We have to dup the FD to avoid double close and races
+	// Neither libpq nor boost allow us to destruct without closing FD
+	int fd_dup = dup(__fd);
+	if (fd_dup == -1)
+		throw std::system_error(std::error_code(errno, std::system_category()), "dup");
+
+	if (sa.sa_family == AF_UNIX)
+		unix_socket = std::make_unique<boost::asio::local::stream_protocol::socket>(
+			io_service, boost::asio::local::stream_protocol(), fd_dup);
+	else
+		tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(
+			io_service, sa.sa_family == AF_INET ?
+				    boost::asio::ip::tcp::v4() : boost::asio::ip::tcp::v6(), fd_dup);
+
+	start_io_timer();
+}
+
 void Client::do_connect() {
 	do_destruct();
 	config_resolve_envvars();
@@ -114,26 +139,8 @@ void Client::do_connect() {
 	PQsetnonblocking(conn, 1);
 
 	int fd = PQsocket(conn);
-	struct sockaddr sa;
-	socklen_t len = sizeof(sa);
-	if (getsockname(fd, &sa, &len))
-		throw std::system_error(std::error_code(errno, std::system_category()), "getsockname");
 
-	// We have to dup the FD to avoid double close and races
-	// Neither libpq nor boost allow us to destruct without closing FD
-	int fd_dup = dup(fd);
-	if (fd_dup == -1)
-		throw std::system_error(std::error_code(errno, std::system_category()), "dup");
-
-	if (sa.sa_family == AF_UNIX)
-		unix_socket = std::make_unique<boost::asio::local::stream_protocol::socket>(
-			io_strand, boost::asio::local::stream_protocol(), fd_dup);
-	else
-		tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(
-			io_strand, sa.sa_family == AF_INET ?
-				boost::asio::ip::tcp::v4() : boost::asio::ip::tcp::v6(), fd_dup);
-
-	start_io_timer();
+	setup_asio_sockets(fd);
 
 	while (true) {
 		auto pstat = PQconnectPoll(conn);
@@ -172,10 +179,10 @@ size_t Client::io_wait_readable() {
 	printf("waiting read\n");
 	io_timeout_timer.expires_from_now(io_timeout_duration);
 	if (tcp_socket) {
-		tcp_socket->async_read_some(boost::asio::null_buffers(), yield_ctx);
+		tcp_socket->async_read_some(boost::asio::null_buffers(), *yield_ctx);
 		return tcp_socket->available();
 	} else {
-		unix_socket->async_read_some(boost::asio::null_buffers(), yield_ctx);
+		unix_socket->async_read_some(boost::asio::null_buffers(), *yield_ctx);
 		return unix_socket->available();
 	}
 }
@@ -184,9 +191,9 @@ void Client::io_wait_writable() {
 	printf("waiting write\n");
 	io_timeout_timer.expires_from_now(io_timeout_duration);
 	if (tcp_socket) {
-		tcp_socket->async_write_some(boost::asio::null_buffers(), yield_ctx);
+		tcp_socket->async_write_some(boost::asio::null_buffers(), *yield_ctx);
 	} else {
-		unix_socket->async_write_some(boost::asio::null_buffers(), yield_ctx);
+		unix_socket->async_write_some(boost::asio::null_buffers(), *yield_ctx);
 	}
 }
 
@@ -249,6 +256,11 @@ void Client::connect() {
 }
 
 Result Client::query(const std::string &__query_str) {
+	while (auto r = PQgetResult(conn)) {
+		auto s = PQresultStatus(r);
+		printf("more results: %d\n", s);
+	}
+
 	if (!PQsendQuery(conn, __query_str.c_str())) {
 		throw pqpp::Exception(conn, "PQsendQuery");
 	}
@@ -259,6 +271,11 @@ Result Client::query(const std::string &__query_str) {
 
 	if (!result)
 		throw pqpp::Exception(conn, "PQgetResult");
+
+	while (auto r = PQgetResult(conn)) {
+		auto s = PQresultStatus(r);
+		printf("more results: %d\n", s);
+	}
 
 	auto status = PQresultStatus(result);
 
@@ -284,6 +301,11 @@ Result Client::query(const std::string &__query_str, const std::vector<std::stri
 	for (size_t i=0; i<arr_size; i++) {
 		params_str[i] = __values[i].data();
 		params_len[i] = (int)__values[i].size();
+	}
+
+	while (auto r = PQgetResult(conn)) {
+		auto s = PQresultStatus(r);
+		printf("more results: %d\n", s);
 	}
 
 	if (!PQsendQueryParams(conn, __query_str.c_str(), arr_size, nullptr, params_str, params_len,
@@ -334,10 +356,10 @@ void Client::query(const std::string &__query_str, const std::vector<std::string
 }
 
 void Client::start_io_timer() {
-	if (conf->io_timeout) {
+	if (conf->io_timeout != -1) {
 		io_timeout_duration = std::chrono::seconds(conf->io_timeout);
 		if (tcp_socket) {
-			boost::asio::spawn(io_strand, [this](boost::asio::yield_context _yield_ctx) {
+			boost::asio::spawn(io_service, [this](boost::asio::yield_context _yield_ctx) {
 				do {
 					boost::system::error_code ec;
 					io_timeout_timer.async_wait(_yield_ctx[ec]);
@@ -358,7 +380,7 @@ void Client::start_io_timer() {
 				} while (tcp_socket->is_open());
 			});
 		} else {
-			boost::asio::spawn(io_strand, [this](boost::asio::yield_context _yield_ctx) {
+			boost::asio::spawn(io_service, [this](boost::asio::yield_context _yield_ctx) {
 				do {
 					boost::system::error_code ec;
 					io_timeout_timer.async_wait(_yield_ctx[ec]);
@@ -382,6 +404,13 @@ void Client::start_io_timer() {
 		}
 	}
 }
+
+void Client::release() {
+	if (parent_pool_ctx)
+		parent_pool_ctx->give_back(shared_from_this());
+}
+
+
 
 
 

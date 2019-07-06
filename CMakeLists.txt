@@ -21,6 +21,9 @@ target_link_libraries(pqpp_static boost_system boost_coroutine pthread pq ssl cr
 add_executable(pqpp_demo demo.cpp)
 target_link_libraries(pqpp_demo pqpp)
 
+add_executable(pqpp_demo_pool demo_pool.cpp)
+target_link_libraries(pqpp_demo_pool pqpp)
+
 install(TARGETS pqpp
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 

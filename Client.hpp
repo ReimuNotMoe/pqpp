@@ -28,29 +28,34 @@ namespace pqpp {
 
 		std::string connection_string;
 
-		time_t io_timeout = 0;
-		time_t idle_timeout = 0;
+		time_t io_timeout = -1;
+		time_t idle_timeout = -1;
+		time_t queue_timeout = -1;
 
 		size_t pool_size = 0;
 	};
 
+	class pool_ctx;
 	class Pool;
+	class PoolExposed;
 
-	class Client {
+	class Client : public std::enable_shared_from_this<Client> {
 	protected:
 
 		std::shared_ptr<client_config> conf;
 
-		boost::asio::io_service& io_strand;
+		boost::asio::io_service& io_service;
 		boost::asio::system_timer io_timeout_timer;
 		boost::asio::system_timer idle_timeout_timer;
 		std::chrono::seconds io_timeout_duration;
+		boost::asio::yield_context *yield_ctx = nullptr;
+
 		std::unique_ptr<boost::asio::ip::tcp::socket> tcp_socket;
 		std::unique_ptr<boost::asio::local::stream_protocol::socket> unix_socket;
-		boost::asio::yield_context& yield_ctx;
-		std::shared_ptr<Pool> parent_pool;
-		bool __connected = false;
 
+		std::shared_ptr<pool_ctx> parent_pool_ctx;
+
+		bool __connected = false;
 		PGconn *conn = nullptr;
 
 		std::function<void(const std::exception *)> callback_connect;
@@ -61,6 +66,8 @@ namespace pqpp {
 		void do_query();
 		void do_destruct();
 
+		void setup_asio_sockets(int __fd);
+
 		size_t io_wait_readable();
 		void io_wait_writable();
 
@@ -68,15 +75,19 @@ namespace pqpp {
 		void start_idle_timer();
 
 	public:
-		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context& __yield_ctx);
+		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context *__yield_ctx);
 
-		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context& __yield_ctx, std::shared_ptr<Pool>& __parent_pool);
+		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context *__yield_ctx, std::shared_ptr<pool_ctx> __parent_pool_ctx);
 
-		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context& __yield_ctx, struct client_config __config);
+		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context *__yield_ctx, struct client_config __config);
 
-		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context& __yield_ctx, const std::function<void(pqpp::client_config&)>& cfg_func);
+		Client(boost::asio::io_service& __io_svc, boost::asio::yield_context *__yield_ctx, const std::function<void(pqpp::client_config&)>& cfg_func);
 
 		virtual ~Client();
+
+		void assign_yield_context(boost::asio::yield_context *__yield_ctx) {
+			yield_ctx = __yield_ctx;
+		}
 
 		void config(std::shared_ptr<client_config>& __config);
 		void config(struct client_config __config);
@@ -89,9 +100,8 @@ namespace pqpp {
 			return __connected;
 		}
 
-		void release() {
 
-		}
+		void release();
 
 		Result query(const std::string& __query_str);
 		Result query(const std::string& __query_str, const std::vector<std::string>& __values);

@@ -17,12 +17,12 @@
 
 int main() {
 
-	boost::asio::io_service iostr;
+	boost::asio::io_service iosvc;
 //	boost::asio::io_service::strand iostr(iosvc);
 
 	// Coroutine 1
-	boost::asio::spawn(iostr, [&](boost::asio::yield_context yield_ctx){
-		pqpp::Client client(iostr, yield_ctx);
+	boost::asio::spawn(iosvc, [&](boost::asio::yield_context yield_ctx){
+		pqpp::Client client(iosvc, &yield_ctx);
 
 		client.config({
 				      .user = "root"
@@ -37,22 +37,28 @@ int main() {
 
 		std::cout << "coroutine1: connected!\n";
 
-		auto res = client.query("SELECT * FROM public.test;");
+		try {
+			auto res = client.query("SELECT * FROM public.test;");
 
-		std::cout << "coroutine1: There are " << res.rows.size() << " rows.\n\n";
+			std::cout << "coroutine1: There are " << res.rows.size() << " rows.\n\n";
 
-		for (auto &it_r : res.rows) {
-			std::cout << "coroutine1: ";
-			for (auto &it_c : it_r) {
-				std::cout << it_c << " ";
+			for (auto &it_r : res.rows) {
+				std::cout << "coroutine1: ";
+				for (auto &it_c : it_r) {
+					std::cout << it_c << " ";
+				}
+				std::cout << "\n";
 			}
-			std::cout << "\n";
+		} catch (std::exception &e) {
+			std::cout << "coroutine1: whoa! " << e.what() << "\n";
+			return;
 		}
+
 	});
 
 	// Coroutine 2, callback style
-	boost::asio::spawn(iostr, [&](boost::asio::yield_context yield_ctx){
-		pqpp::Client client(iostr, yield_ctx);
+	boost::asio::spawn(iosvc, [&](boost::asio::yield_context yield_ctx){
+		pqpp::Client client(iosvc, &yield_ctx);
 
 		client.config([](auto &cfg){
 			cfg.user = "root";
@@ -67,6 +73,11 @@ int main() {
 				std::cout << "coroutine2: connected!\n";
 
 			client.query("SELECT * FROM public.test;", [](auto err, auto &res){
+				if (err) {
+					std::cout << "coroutine2: whoa! " << err->what() << "\n";
+					return;
+				}
+
 				std::cout << "coroutine2: There are " << res.rows.size() << " rows.\n\n";
 
 				for (auto &it_r : res.rows) {
@@ -83,6 +94,6 @@ int main() {
 
 	});
 
-	iostr.run();
+	iosvc.run();
 
 }
